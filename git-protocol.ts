@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { constants as bufferConstants } from 'node:buffer';
 import { deflateSync, inflateSync } from 'node:zlib';
 export const PKT_LINE_MAX = 65520;
 export const PKT_LINE_MAX_PAYLOAD = PKT_LINE_MAX - 4;
@@ -314,6 +315,7 @@ function readVarintSize(buffer: Buffer, start: number): { size: number; next: nu
     if (offset >= buffer.length) throw new GitProtocolError('pack entry size varint is truncated', 'pack-truncated');
     byte = buffer[offset++];
     size += (byte & 0x7f) * 2 ** shift;
+    if (!Number.isSafeInteger(size)) throw new GitProtocolError('pack entry size exceeds the safe integer range', 'pack-corrupt');
     shift += 7;
     if (shift > 63) throw new GitProtocolError('pack entry size varint is too long', 'pack-corrupt');
   }
@@ -329,16 +331,17 @@ function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; 
     if (offset >= buffer.length) throw new GitProtocolError('ofs-delta base offset is truncated', 'pack-truncated');
     byte = buffer[offset++];
     value = ((value + 1) * 128) + (byte & 0x7f);
+    if (!Number.isSafeInteger(value)) throw new GitProtocolError('ofs-delta base offset exceeds the safe integer range', 'pack-corrupt');
   }
   return { baseOffset: value, next: offset };
 }
 
 /** Inflate one zlib stream at `offset`; returns its bytes and the offset just past the stream. */
-export function inflateAt(buffer: Uint8Array, offset: number): { data: Buffer; next: number } {
+export function inflateAt(buffer: Uint8Array, offset: number, maxOutputLength?: number): { data: Buffer; next: number } {
   const view = asBuffer(buffer).subarray(offset);
   let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    result = inflateSync(view, { info: true, ...(maxOutputLength === undefined ? {} : { maxOutputLength }) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   } catch (err) {
     throw new GitProtocolError(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`, 'pack-zlib');
   }
@@ -359,6 +362,7 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
       if (offset >= deltaBuffer.length) throw new GitProtocolError('delta size varint is truncated', 'delta-corrupt');
       const byte = deltaBuffer[offset++];
       value += (byte & 0x7f) * 2 ** shift;
+      if (!Number.isSafeInteger(value)) throw new GitProtocolError('delta size exceeds the safe integer range', 'delta-corrupt');
       shift += 7;
       if (!(byte & 0x80)) break;
       if (shift > 63) throw new GitProtocolError('delta size varint is too long', 'delta-corrupt');
@@ -367,6 +371,9 @@ export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
   };
   const sourceSize = readSize();
   const targetSize = readSize();
+  if (targetSize > bufferConstants.MAX_LENGTH) {
+    throw new GitProtocolError(`delta target size ${targetSize} exceeds the buffer limit`, 'delta-size');
+  }
   if (sourceSize !== baseBuffer.length) {
     throw new GitProtocolError(`delta expects a ${sourceSize}-byte base, got ${baseBuffer.length}`, 'delta-base-size');
   }
@@ -458,6 +465,9 @@ export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readVarintSize(buffer, offset);
+    if (header.size > bufferConstants.MAX_LENGTH) {
+      throw new GitProtocolError(`pack entry size ${header.size} exceeds the buffer limit`, 'pack-size');
+    }
     offset = header.next;
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
@@ -475,7 +485,7 @@ export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup
     } else if (!CODE_TYPE[typeCode]) {
       throw new GitProtocolError(`pack entry ${index} has unknown type code ${typeCode}`, 'pack-type');
     }
-    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset, Math.max(1, header.size));
     if (inflated.data.length !== header.size) {
       throw new GitProtocolError(
         `pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`,

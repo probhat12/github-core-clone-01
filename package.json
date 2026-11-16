@@ -9,6 +9,7 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "start": "node --experimental-strip-types main.ts"
+    "start": "node --experimental-strip-types main.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   }
 }
